@@ -1,116 +1,120 @@
 #include <util/delay.h>
+#include <avr/eeprom.h>
+#include <avr/io.h>
 
-#define IN1  3    // PB3 (Вывод 2)
-#define IN2  4    // PB4 (Вывод 3)
-#define UI   2    // PB2 (Вывод 7)
-#define OUT1 0    // PB0 (Вывод 5)
-#define OUT2 1    // PB1 (Вывод 6)
+// Распиновка (физические ножки):
+// PB0 (5) - OUT1, PB1 (6) - OUT2, PB2 (7) - UI, PB3 (2) - IN1, PB4 (3) - IN2
 
-int mode = 1;
-unsigned long lastTick = 0;
-int flashCounter = 0;
+uint8_t mode = 1;
+uint32_t lastTick = 0;
+uint16_t flashCounter = 0;
 bool ledState = false;
-int pressCounter = 0;
+uint8_t pressCounter = 0;
 bool isWaitingRelease = false;
 
-// Инициализируем таймеры так, чтобы таймаут уже истек (минус 1000 мс)
-unsigned long lastImpulse1 = -1000; 
-unsigned long lastImpulse2 = -1000;
-const int pulseTimeout = 25;
+uint32_t lastModeChange = 0;
+bool needSave = false;
 
-unsigned long offTimer = -2001; // Устанавливаем значение в прошлом
+uint32_t lastImpulse1 = 0; 
+uint32_t lastImpulse2 = 0;
+uint32_t offTimer = 0;
 bool pendingOff = false;
 
+uint8_t EEMEM eeprom_mode_addr = 1;
+
+// Работа с выходами (Аппаратный CTC 1кГц)
 void setOutput(bool ch1, bool ch2) {
-  uint8_t reg = (1 << WGM01); 
-  if (ch1) reg |= (1 << COM0A0); 
-  else { reg &= ~(1 << COM0A0); digitalWrite(OUT1, LOW); }
-  
-  if (ch2) reg |= (1 << COM0B0); 
-  else { reg &= ~(1 << COM0B0); digitalWrite(OUT2, LOW); }
-  TCCR0A = reg;
+    uint8_t reg = (1 << WGM01);
+    if (ch1) reg |= (1 << COM0A0); else PORTB &= ~(1 << PB0);
+    if (ch2) reg |= (1 << COM0B0); else PORTB &= ~(1 << PB1);
+    TCCR0A = reg;
 }
 
 void setup() {
-  // Принудительно гасим выходы сразу
-  pinMode(OUT1, OUTPUT);
-  pinMode(OUT2, OUTPUT);
-  digitalWrite(OUT1, LOW);
-  digitalWrite(OUT2, LOW);
-  
-  pinMode(IN1, INPUT);
-  pinMode(IN2, INPUT);
-  pinMode(UI, OUTPUT);
-  digitalWrite(UI, LOW);
+    DDRB = (1 << PB0) | (1 << PB1) | (1 << PB2); // Выходы
+    PORTB &= ~((1 << PB0) | (1 << PB1) | (1 << PB2)); // Все в LOW
 
-  // Ждем стабилизации питания и входов (0.2 сек)
-  _delay_ms(200);
+    mode = eeprom_read_byte(&eeprom_mode_addr);
+    if (mode < 1 || mode > 4) mode = 1;
 
-  // Настройка Таймера 0 (Режим CTC)
-  TCCR0A = (1 << WGM01); 
-  TCCR0B = (1 << CS01) | (1 << CS00); 
-  OCR0A = 74; // 1 кГц
+    _delay_ms(200);
+
+    TCCR0A = (1 << WGM01); 
+    TCCR0B = (1 << CS01) | (1 << CS00); // делитель 64
+    OCR0A = 74; // 1 кГц
+    
+    lastImpulse1 = lastImpulse2 = 0;
+    offTimer = 0;
 }
 
 void loop() {
-  unsigned long currentMillis = millis();
+    uint32_t ms = millis();
 
-  // 1. ДЕТЕКТОР ВХОДА
-  if (digitalRead(IN1) == HIGH) lastImpulse1 = currentMillis;
-  if (digitalRead(IN2) == HIGH) lastImpulse2 = currentMillis;
+    // 1. ДЕТЕКТОР ВХОДА (Прямое чтение пинов)
+    if (PINB & (1 << PB3)) lastImpulse1 = ms;
+    if (PINB & (1 << PB4)) lastImpulse2 = ms;
 
-  bool s1 = (currentMillis - lastImpulse1 < pulseTimeout);
-  bool s2 = (currentMillis - lastImpulse2 < pulseTimeout);
+    bool s1 = (ms - lastImpulse1 < 25);
+    bool s2 = (ms - lastImpulse2 < 25);
 
-  // 2. КНОПКА И LED (раз в 50 мс)
-  if (currentMillis - lastTick >= 50) {
-    lastTick = currentMillis;
-    digitalWrite(UI, LOW);
-    pinMode(UI, INPUT_PULLUP);
-    _delay_us(300);
-    bool btnNow = digitalRead(UI);
-    pinMode(UI, OUTPUT);
+    // 2. КНОПКА И ИНДИКАЦИЯ (Раз в 50мс)
+    if (ms - lastTick >= 50) {
+        lastTick = ms;
+        
+        // Опрос кнопки
+        PORTB &= ~(1 << PB2); DDRB &= ~(1 << PB2); // INPUT
+        PORTB |= (1 << PB2); // PULLUP
+        _delay_us(100);
+        bool btnNow = !(PINB & (1 << PB2)); // LOW = нажато
+        DDRB |= (1 << PB2); // OUTPUT обратно
 
-    if (btnNow == LOW) {
-      if (!isWaitingRelease) {
-        pressCounter++;
-        if (pressCounter >= 5) {
-          mode++; if (mode > 3) mode = 1;
-          isWaitingRelease = true;
+        if (btnNow) {
+            if (!isWaitingRelease) {
+                if (++pressCounter >= 5) {
+                    if (++mode > 4) mode = 1;
+                    lastModeChange = ms;
+                    needSave = true;
+                    isWaitingRelease = true;
+                }
+            }
+        } else { pressCounter = 0; isWaitingRelease = false; }
+
+        if (needSave && (ms - lastModeChange >= 5000)) {
+            eeprom_update_byte(&eeprom_mode_addr, mode);
+            needSave = false;
         }
-      }
-    } else { pressCounter = 0; isWaitingRelease = false; }
 
-    flashCounter++;
-    if (flashCounter >= 10) { ledState = !ledState; flashCounter = 0; }
-    if (mode == 1) digitalWrite(UI, LOW);
-    else if (mode == 2) digitalWrite(UI, HIGH);
-    else if (mode == 3) digitalWrite(UI, ledState);
-  }
-
-  // 3. ЛОГИКА РЕЖИМОВ
-  bool t1 = false, t2 = false;
-  if (mode == 1) { t1 = s1; t2 = s2; }
-  else if (mode == 2) { t1 = s1; t2 = s1; }
-  else if (mode == 3) { bool any = (s1 || s2); t1 = any; t2 = any; }
-
-  // 4. ВЫВОД С ПАУЗОЙ 2С
-   if (!t1 && !t2) {
-    if (!pendingOff) { 
-      offTimer = currentMillis; 
-      pendingOff = true; 
+        // LED логика
+        flashCounter++;
+        if (mode == 1) PORTB &= ~(1 << PB2);
+        else if (mode == 2) PORTB |= (1 << PB2);
+        else if (mode == 3) {
+            if (flashCounter >= 10) { ledState = !ledState; flashCounter = 0; }
+            if (ledState) PORTB |= (1 << PB2); else PORTB &= ~(1 << PB2);
+        } else if (mode == 4) {
+            if (flashCounter < 4 || (flashCounter >= 6 && flashCounter < 10)) PORTB |= (1 << PB2);
+            else PORTB &= ~(1 << PB2);
+            if (flashCounter >= 20) flashCounter = 0;
+        }
     }
-    // Если прошло более 2 секунд с момента пропадания сигнала
-    if (currentMillis - offTimer >= 2000) {
-      setOutput(false, false);
+
+    // 3. РЕЖИМЫ
+    bool t1 = false, t2 = false;
+    if (mode == 1) { t1 = s1; t2 = s2; }
+    else if (mode == 2) { t1 = s1; t2 = s1; }
+    else if (mode == 3) { bool any = (s1 || s2); t1 = any; t2 = any; }
+    else if (mode == 4) { t1 = s1; t2 = (s1 || s2); }
+
+    // 4. ВЫВОД С ПАУЗОЙ
+    if (!t1 && !t2) {
+        if (!pendingOff) { offTimer = ms; pendingOff = true; }
+        if (ms - offTimer >= 2000) setOutput(false, false);
+        else {
+            if (offTimer > 500) setOutput(true, true);
+            else setOutput(false, false);
+        }
     } else {
-      // Это условие сработает только если ТЭНы РЕАЛЬНО работали перед этим
-      // Проверяем, не является ли это холодным стартом
-      if (offTimer > 500) setOutput(true, true); 
-      else setOutput(false, false);
+        pendingOff = false;
+        setOutput(t1, t2);
     }
-  } else {
-    pendingOff = false;
-    setOutput(t1, t2);
-  } 
 }
